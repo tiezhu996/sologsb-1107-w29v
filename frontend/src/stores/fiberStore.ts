@@ -31,7 +31,7 @@ export const useFiberStore = create<FiberStore>((set, get) => ({
     try {
       const payload = plain(input)
       const id = Number(await db.fiberBatches.add(payload))
-      const created: FiberBatch = { ...payload, id, schemaRev: 2 }
+      const created: FiberBatch = { ...payload, id, schemaRev: 3 }
       set((state) => ({ fiberBatches: [created, ...state.fiberBatches] }))
       return created
     } catch {

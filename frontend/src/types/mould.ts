@@ -10,12 +10,20 @@ export interface Mould {
   frameW: number
   frameH: number
   wireMaterial: WireMaterial
-  wireDiameter: number
-  stripeGap: number
-  meshDensity: number
+  /** 当前丝径，取最近生效的维修版本；可能待补录 */
+  wireDiameter: number | null
+  /** 当前帘纹间距，取最近生效的维修版本；可能待补录 */
+  stripeGap: number | null
+  meshDensity: number | null
   weaver: string
   state: MouldStateValue
+  /** 当前参数对应的版本快照编号 */
+  currentVersionId: number | null
   schemaRev?: number
 }
 
-export type MouldInput = Omit<Mould, 'id' | 'schemaRev'>
+export type MouldInput = Omit<Mould, 'id' | 'schemaRev' | 'currentVersionId' | 'wireDiameter' | 'stripeGap' | 'meshDensity'> & {
+  wireDiameter: number
+  stripeGap: number
+  meshDensity?: number
+}

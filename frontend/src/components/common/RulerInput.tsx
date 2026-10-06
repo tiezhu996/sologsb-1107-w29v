@@ -3,8 +3,8 @@ import type { ReactNode } from 'react'
 
 interface RulerInputProps {
   label: string
-  value: number
-  onChange: (value: number) => void
+  value: number | null
+  onChange: (value: number | null) => void
   unit?: string
   min?: number
   max?: number
@@ -13,6 +13,7 @@ interface RulerInputProps {
   testId?: string
   disabled?: boolean
   compact?: boolean
+  allowEmpty?: boolean
 }
 
 export function RulerInput({
@@ -27,6 +28,7 @@ export function RulerInput({
   testId,
   disabled = false,
   compact = false,
+  allowEmpty = false,
 }: RulerInputProps) {
   return (
     <Box sx={{ width: '100%' }}>
@@ -46,8 +48,14 @@ export function RulerInput({
         size="small"
         type="number"
         label={label}
-        value={Number.isFinite(value) ? value : ''}
-        onChange={(event) => onChange(Number(event.target.value))}
+        value={value === null || value === undefined ? '' : value}
+        onChange={(event) => {
+          if (event.target.value === '') {
+            onChange(allowEmpty ? null : 0)
+          } else {
+            onChange(Number(event.target.value))
+          }
+        }}
         disabled={disabled}
         inputProps={{ min, max, step, 'data-testid': testId }}
         InputProps={{

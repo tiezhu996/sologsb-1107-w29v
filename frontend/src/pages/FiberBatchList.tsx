@@ -95,7 +95,7 @@ export default function FiberBatchList() {
                 </TextField>
               </Grid>
               <Grid item xs={12} md={5}>
-                <RulerInput label="打浆度" value={form.beatingDegree} onChange={(value) => updateForm('beatingDegree', value)} unit="°SR" min={10} max={60} step={1} testId="field-beatingDegree" />
+                <RulerInput label="打浆度" value={form.beatingDegree} onChange={(value) => updateForm('beatingDegree', value ?? 0)} unit="°SR" min={10} max={60} step={1} testId="field-beatingDegree" />
               </Grid>
               <Grid item xs={12} md={4}><TextField fullWidth label="操作人" value={form.operator} onChange={(event) => updateForm('operator', event.target.value)} inputProps={{ 'data-testid': 'field-operator' }} /></Grid>
             </Grid>
@@ -115,7 +115,7 @@ export default function FiberBatchList() {
               {FIBER_MATERIALS.map((option) => <option key={option} value={option}>{option}</option>)}
             </TextField>
             <Box sx={{ width: 250 }}>
-              <RulerInput label="打浆度上限" value={degreeLimit} onChange={setDegreeLimit} unit="°SR" min={10} max={60} step={1} compact />
+              <RulerInput label="打浆度上限" value={degreeLimit} onChange={(value) => setDegreeLimit(value ?? 0)} unit="°SR" min={10} max={60} step={1} compact />
             </Box>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, ml: { md: 'auto' } }}>
               <Typography variant="body2" color="text.secondary">当前记录</Typography>
@@ -160,7 +160,7 @@ export default function FiberBatchList() {
                       {relatedRuns.map((run) => (
                         <TableRow key={run.id ?? run.runNo}>
                           <TableCell>{run.runNo}</TableCell><TableCell>{run.runDate}</TableCell><TableCell>{run.operator}</TableCell>
-                          <TableCell align="right">{run.grammage} 克/平方米</TableCell><TableCell align="right">{run.measuredGap.toFixed(2)} mm</TableCell>
+                          <TableCell align="right">{run.grammage} 克/平方米</TableCell><TableCell align="right">{run.measuredGap === null ? '待补录' : `${run.measuredGap.toFixed(2)} mm`}</TableCell>
                         </TableRow>
                       ))}
                     </TableBody>
