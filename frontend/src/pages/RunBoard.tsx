@@ -5,9 +5,11 @@ import { RulerInput } from '../components/common/RulerInput'
 import { useUnitConvert } from '../hooks/useUnitConvert'
 import { useFiberStore } from '../stores/fiberStore'
 import { useMouldStore } from '../stores/mouldStore'
+import { useMouldVersionStore } from '../stores/mouldVersionStore'
 import { useRunStore } from '../stores/runStore'
 import { DRY_METHODS, STRIPE_DIRECTIONS, type DryMethod, type SheetRunInput, type StripeDirection } from '../types/sheet-run'
-import { calculateDeviation, getGapConclusion, isGapOutOfTolerance } from '../utils/stripe'
+import { getGapConclusion } from '../utils/stripe'
+import { findEffectiveVersion } from '../utils/mouldVersion'
 
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10)
@@ -25,7 +27,6 @@ const emptyRunForm: SheetRunInput = {
   dryMethod: '火墙',
   grammage: 32,
   measuredGap: 1.1,
-  deviation: 0,
 }
 
 const processSteps: ProcessStep[] = [
@@ -33,8 +34,19 @@ const processSteps: ProcessStep[] = [
   { label: '帘床就位', detail: '确认纸帘方向与框架张力。', status: 'done' },
   { label: '入槽抄纸', detail: '按设定次数完成荡料与提帘。', status: 'active' },
   { label: '压榨定形', detail: '控制叠高后转火墙或日晒。', status: 'pending' },
-  { label: '量纹偏差', detail: '实测间距并与纸帘标准值比较。', status: 'pending' },
+  { label: '量纹偏差', detail: '实测间距并与工序当日命中的纸帘版本比较。', status: 'pending' },
 ]
+
+const PARAM_CHIP: Record<string, { color: 'success' | 'warning' | 'info'; label: string }> = {
+  qualified: { color: 'success', label: '合格' },
+  exceeded: { color: 'warning', label: '超差' },
+  pendingData: { color: 'info', label: '待补录' },
+}
+
+function formatDev(value: number | null): string {
+  if (value === null) return '—'
+  return `${value > 0 ? '+' : ''}${value.toFixed(2)} mm`
+}
 
 export default function RunBoard() {
   const runs = useRunStore((state) => state.sheetRuns)
@@ -45,6 +57,8 @@ export default function RunBoard() {
   const moulds = useMouldStore((state) => state.moulds)
   const mouldError = useMouldStore((state) => state.error)
   const loadMoulds = useMouldStore((state) => state.loadMoulds)
+  const versions = useMouldVersionStore((state) => state.versions)
+  const loadVersions = useMouldVersionStore((state) => state.loadVersions)
   const batches = useFiberStore((state) => state.fiberBatches)
   const batchError = useFiberStore((state) => state.error)
   const loadBatches = useFiberStore((state) => state.loadFiberBatches)
@@ -59,10 +73,12 @@ export default function RunBoard() {
   useEffect(() => {
     void loadRuns()
     void loadMoulds()
+    void loadVersions()
     void loadBatches()
-  }, [loadBatches, loadMoulds, loadRuns])
+  }, [loadBatches, loadMoulds, loadRuns, loadVersions])
 
   const mouldById = useMemo(() => new Map(moulds.map((mould) => [mould.id, mould])), [moulds])
+  const versionById = useMemo(() => new Map(versions.map((version) => [version.id, version])), [versions])
   const batchById = useMemo(() => new Map(batches.map((batch) => [batch.id, batch])), [batches])
   const filteredRuns = useMemo(
     () => runs.filter((run) => {
@@ -73,26 +89,35 @@ export default function RunBoard() {
     }),
     [dateFilter, mouldById, mouldFilter, runs],
   )
-  const selectedMould = mouldById.get(form.mouldId) ?? moulds[0]
-  const formDeviation = calculateDeviation(form.measuredGap, selectedMould?.stripeGap ?? form.measuredGap)
+
+  // 表单预览：严格按所选工序日期匹配当天以前最近一版，绝不取当前值
+  const formVersion = useMemo(
+    () => findEffectiveVersion(versions, form.mouldId, form.runDate || '1970-01-01'),
+    [versions, form.mouldId, form.runDate],
+  )
+  const formStandardGap = formVersion?.stripeGap ?? null
+  const formDeviation = formStandardGap === null ? null : Number((form.measuredGap - formStandardGap).toFixed(2))
+  const formStatus = formStandardGap === null ? 'pendingData' : Math.abs(formDeviation ?? 0) > 0.2 ? 'exceeded' : 'qualified'
   const latestRun = runs[0]
 
   const updateForm = <K extends keyof SheetRunInput,>(key: K, value: SheetRunInput[K]) => {
     setForm((current) => ({ ...current, [key]: value }))
   }
 
-  const handleMouldChange = (mouldId: number) => {
+  const handleMouldOrDateChange = (patch: Partial<SheetRunInput>) => {
     setForm((current) => {
-      const mould = mouldById.get(mouldId)
-      const standardGap = mould?.stripeGap ?? current.measuredGap
-      return { ...current, mouldId, measuredGap: standardGap, deviation: calculateDeviation(standardGap, standardGap) }
+      const next = { ...current, ...patch }
+      const effective = findEffectiveVersion(versions, next.mouldId, next.runDate || '1970-01-01')
+      // 命中版本时把实测预置为该版标准间距，便于录入；无版本则保留原值并提示待补录
+      if (effective) next.measuredGap = effective.stripeGap
+      return next
     })
   }
 
   const handleSubmit = async () => {
     if (!form.runNo.trim() || !form.operator.trim() || form.measuredGap <= 0 || form.grammage <= 0) return
     setSubmitting(true)
-    const created = await addRun({ ...form, runNo: form.runNo.trim(), operator: form.operator.trim(), deviation: formDeviation })
+    const created = await addRun({ ...form, runNo: form.runNo.trim(), operator: form.operator.trim() })
     setSubmitting(false)
     if (created) {
       setForm(emptyRunForm)
@@ -101,13 +126,14 @@ export default function RunBoard() {
   }
 
   const error = runError ?? mouldError ?? batchError
+  const formChip = PARAM_CHIP[formStatus]
 
   return (
     <Stack spacing={3}>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, alignItems: { xs: 'flex-start', md: 'center' }, flexDirection: { xs: 'column', md: 'row' } }}>
         <Box>
           <Typography component="h1" variant="h3" color="#344a34">抄纸工序记录台</Typography>
-          <Typography color="text.secondary" sx={{ mt: 0.75 }}>关联纸帘与料批，记录抄纸参数，并在行内复测帘纹间距。</Typography>
+          <Typography color="text.secondary" sx={{ mt: 0.75 }}>关联纸帘与料批，按工序日期匹配当天以前最近一版纸帘参数，行内复测帘纹偏差。</Typography>
         </Box>
         <Button variant="contained" size="large" onClick={() => setShowForm((current) => !current)} data-testid="new-run">
           {showForm ? '收起登记' : '新建工序'}
@@ -119,16 +145,19 @@ export default function RunBoard() {
       {showForm && (
         <Card data-testid="form-run" sx={{ borderColor: '#9eb096' }}>
           <CardContent sx={{ p: { xs: 2, md: 3 } }}>
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 2, mb: 2 }}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 2, mb: 2, flexWrap: 'wrap' }}>
               <Typography variant="h5">登记抄纸工序</Typography>
-              <Chip color={isGapOutOfTolerance(formDeviation) ? 'warning' : 'success'} label={`偏差 ${formDeviation > 0 ? '+' : ''}${formDeviation.toFixed(2)} mm`} />
+              <Stack direction="row" spacing={1} flexWrap="wrap">
+                <Chip size="small" variant="outlined" label={formVersion ? `命中 v${formVersion.seq} · ${formVersion.versionDate}` : '无历史版本，待补录'} data-testid="form-matched-version" />
+                <Chip size="small" color={formChip.color} label={formDeviation === null ? '待补录（缺失参数）' : `偏差 ${formatDev(formDeviation)}`} />
+              </Stack>
             </Box>
             <Grid container spacing={2}>
               <Grid item xs={12} md={3}><TextField fullWidth label="工序编号" value={form.runNo} onChange={(event) => updateForm('runNo', event.target.value)} inputProps={{ 'data-testid': 'field-runNo' }} /></Grid>
               <Grid item xs={6} md={2.5}>
-                <TextField select fullWidth label="纸帘" value={form.mouldId} onChange={(event) => handleMouldChange(Number(event.target.value))} SelectProps={{ native: true, inputProps: { 'data-testid': 'field-mouldId' } }}>
+                <TextField select fullWidth label="纸帘" value={form.mouldId} onChange={(event) => handleMouldOrDateChange({ mouldId: Number(event.target.value) })} SelectProps={{ native: true, inputProps: { 'data-testid': 'field-mouldId' } }}>
                   {!moulds.some((mould) => mould.id === form.mouldId) && <option value={form.mouldId}>纸帘数据载入中</option>}
-                  {moulds.filter((mould) => mould.state !== '退役').map((mould) => <option key={mould.id} value={mould.id}>{mould.mouldNo} · {mould.stripeGap} mm</option>)}
+                  {moulds.filter((mould) => mould.state !== '退役').map((mould) => <option key={mould.id} value={mould.id}>{mould.mouldNo} · 当前 {mould.stripeGap} mm</option>)}
                 </TextField>
               </Grid>
               <Grid item xs={6} md={2.5}>
@@ -137,7 +166,7 @@ export default function RunBoard() {
                   {batches.map((batch) => <option key={batch.id} value={batch.id}>{batch.batchNo} · {batch.material}</option>)}
                 </TextField>
               </Grid>
-              <Grid item xs={12} md={2}><TextField fullWidth type="date" label="抄纸日期" value={form.runDate} onChange={(event) => updateForm('runDate', event.target.value)} InputLabelProps={{ shrink: true }} inputProps={{ 'data-testid': 'field-runDate' }} /></Grid>
+              <Grid item xs={12} md={2}><TextField fullWidth type="date" label="抄纸日期" value={form.runDate} onChange={(event) => handleMouldOrDateChange({ runDate: event.target.value })} InputLabelProps={{ shrink: true }} inputProps={{ 'data-testid': 'field-runDate' }} /></Grid>
               <Grid item xs={12} md={2}><TextField fullWidth label="操作人" value={form.operator} onChange={(event) => updateForm('operator', event.target.value)} inputProps={{ 'data-testid': 'field-operator' }} /></Grid>
               <Grid item xs={6} md={2}>
                 <TextField select fullWidth label="帘纹方向" value={form.stripeDirection} onChange={(event) => updateForm('stripeDirection', event.target.value as StripeDirection)} SelectProps={{ native: true, inputProps: { 'data-testid': 'field-stripeDirection' } }}>
@@ -145,7 +174,7 @@ export default function RunBoard() {
                 </TextField>
               </Grid>
               <Grid item xs={6} md={2}><TextField fullWidth type="number" label="荡料次数" value={form.dipCount} onChange={(event) => updateForm('dipCount', Number(event.target.value))} inputProps={{ min: 1, max: 8, step: 1, 'data-testid': 'field-dipCount' }} /></Grid>
-              <Grid item xs={6} md={2}><TextField fullWidth type="number" label="叠高" value={form.stackHeight} onChange={(event) => updateForm('stackHeight', Number(event.target.value))} inputProps={{ min: 10, max: 120, step: 1, 'data-testid': 'field-stackHeight' }} InputProps={{ endAdornment: '张' }} /></Grid>
+              <Grid item xs={6} md={2}><TextField fullWidth type="number" label="叠高" value={form.stackHeight} onChange={(event) => updateForm('stackHeight', Number(event.target.value))} inputProps={{ min: 10, max: 120, step: 1, 'data-testid': 'field-stackHeight' }} /></Grid>
               <Grid item xs={6} md={2}>
                 <TextField select fullWidth label="干燥方式" value={form.dryMethod} onChange={(event) => updateForm('dryMethod', event.target.value as DryMethod)} SelectProps={{ native: true, inputProps: { 'data-testid': 'field-dryMethod' } }}>
                   {DRY_METHODS.map((option) => <option key={option} value={option}>{option}</option>)}
@@ -153,7 +182,18 @@ export default function RunBoard() {
               </Grid>
               <Grid item xs={6} md={2}><TextField fullWidth type="number" label="克重" value={form.grammage} onChange={(event) => updateForm('grammage', Number(event.target.value))} inputProps={{ min: 10, max: 200, step: 1, 'data-testid': 'field-grammage' }} InputProps={{ endAdornment: 'g/m²' }} /></Grid>
               <Grid item xs={12} md={4}>
-                <RulerInput label="实测帘纹间距" value={form.measuredGap} onChange={(value) => updateForm('measuredGap', value)} min={0.1} max={5} step={0.01} testId="field-measuredGap" helperText={`${getGapConclusion(formDeviation)}，允许偏差 ±0.2 mm`} />
+                <RulerInput
+                  label="实测帘纹间距"
+                  value={form.measuredGap}
+                  onChange={(value) => updateForm('measuredGap', value)}
+                  min={0.1}
+                  max={5}
+                  step={0.01}
+                  testId="field-measuredGap"
+                  helperText={formStandardGap === null
+                    ? <Typography component="span" variant="caption" color="info.main">该日期早于任何纸帘版本，参数待补录，不能算合格。允许偏差 ±0.2 mm</Typography>
+                    : <Typography component="span" variant="caption" color={formStatus === 'exceeded' ? 'warning.dark' : 'text.secondary'}>{formStatus === 'exceeded' ? '超差：' : '合格：'}{getGapConclusion(formDeviation ?? 0)}（{formatDev(formDeviation)}，标准 {formStandardGap.toFixed(2)} mm）</Typography>}
+                />
               </Grid>
             </Grid>
             <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 1.5, mt: 2.5 }}>
@@ -174,6 +214,7 @@ export default function RunBoard() {
                   <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', mb: 1.5 }}>
                     <Chip size="small" label={latestRun.runNo} />
                     <Chip size="small" variant="outlined" label={formatGrammage(latestRun.grammage)} />
+                    <Chip size="small" color={PARAM_CHIP[latestRun.paramStatus].color} label={PARAM_CHIP[latestRun.paramStatus].label} />
                   </Box>
                   <ProcessTimeline steps={processSteps} compact />
                 </>
@@ -208,13 +249,14 @@ export default function RunBoard() {
       </Grid>
 
       <TableContainer component={Card}>
-        <Table sx={{ minWidth: 1080 }}>
+        <Table sx={{ minWidth: 1180 }}>
           <TableHead>
             <TableRow>
               <TableCell>工序 / 日期</TableCell>
               <TableCell>纸帘与料批</TableCell>
               <TableCell>抄纸参数</TableCell>
               <TableCell align="right">克重</TableCell>
+              <TableCell>命中版本与标准</TableCell>
               <TableCell>实测间距与偏差</TableCell>
               <TableCell align="right">保存实测</TableCell>
             </TableRow>
@@ -223,11 +265,16 @@ export default function RunBoard() {
             {filteredRuns.map((run) => {
               const mould = mouldById.get(run.mouldId)
               const batch = batchById.get(run.batchId)
+              const matchedVersion = run.matchedVersionId !== null ? versionById.get(run.matchedVersionId) : undefined
+              // 行内复测一律以该工序保存的历史标准值比对，缺失参数则待补录
+              const standardGap = run.standardGap
               const draftGap = run.id === undefined ? run.measuredGap : draftGaps[run.id] ?? run.measuredGap
-              const draftDeviation = calculateDeviation(draftGap, mould?.stripeGap ?? draftGap)
-              const exceeded = isGapOutOfTolerance(draftDeviation)
+              const draftDeviation = standardGap === null ? null : Number((draftGap - standardGap).toFixed(2))
+              const status = standardGap === null ? 'pendingData' : Math.abs(draftDeviation ?? 0) > 0.2 ? 'exceeded' : 'qualified'
+              const chip = PARAM_CHIP[status]
+              const rowBg = status === 'exceeded' ? '#fff7d9' : status === 'pendingData' ? '#eef4fb' : undefined
               return (
-                <TableRow key={run.id ?? run.runNo} data-testid="row-run" hover sx={{ bgcolor: exceeded ? '#fff7d9' : undefined }}>
+                <TableRow key={run.id ?? run.runNo} data-testid="row-run" hover sx={{ bgcolor: rowBg }}>
                   <TableCell>
                     <Typography sx={{ fontWeight: 750 }}>{run.runNo}</Typography>
                     <Typography variant="caption" color="text.secondary">{run.runDate} · {run.operator}</Typography>
@@ -241,6 +288,21 @@ export default function RunBoard() {
                     <Typography variant="caption" color="text.secondary">叠高 {run.stackHeight} 张 · {run.dryMethod} · 帘框 {cmToMm(mould?.frameW ?? 0)} × {cmToMm(mould?.frameH ?? 0)} mm</Typography>
                   </TableCell>
                   <TableCell align="right">{run.grammage} g/m²</TableCell>
+                  <TableCell>
+                    {matchedVersion ? (
+                      <>
+                        <Chip size="small" variant="outlined" label={`v${matchedVersion.seq} · ${matchedVersion.versionDate}`} />
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.4 }}>
+                          标准 {standardGap?.toFixed(2)} mm{matchedVersion.origin === '维修' ? ' · 维修版' : ' · 建帘版'}
+                        </Typography>
+                      </>
+                    ) : (
+                      <Chip size="small" color="info" variant="outlined" label="缺失参数 · 待补录" data-testid={`pending-run-${run.id}`} />
+                    )}
+                    {run.recalcBatchId && (
+                      <Typography variant="caption" color="warning.dark" sx={{ display: 'block', mt: 0.3 }}>重算 {run.recalcBatchId}</Typography>
+                    )}
+                  </TableCell>
                   <TableCell sx={{ minWidth: 270 }}>
                     <RulerInput
                       label="帘纹间距"
@@ -251,19 +313,27 @@ export default function RunBoard() {
                       min={0.1}
                       max={5}
                       step={0.01}
+                      disabled={standardGap === null}
                       testId={run.id === undefined ? undefined : `row-measuredGap-${run.id}`}
-                      helperText={<Typography component="span" variant="caption" color={exceeded ? 'warning.dark' : 'text.secondary'}>{exceeded ? '超差：' : '合格：'}{getGapConclusion(draftDeviation)}（{draftDeviation > 0 ? '+' : ''}{draftDeviation.toFixed(2)} mm）</Typography>}
+                      helperText={
+                        <Typography component="span" variant="caption" color={status === 'exceeded' ? 'warning.dark' : status === 'pendingData' ? 'info.main' : 'text.secondary'}>
+                          <Chip component="span" size="small" color={chip.color} label={chip.label} sx={{ mr: 0.75, height: 18 }} />
+                          {status === 'pendingData'
+                            ? '工序日期早于纸帘版本，补齐维修版本后自动重算'
+                            : `${status === 'exceeded' ? '超差：' : '合格：'}${getGapConclusion(draftDeviation ?? 0)}（${formatDev(draftDeviation)}）`}
+                        </Typography>
+                      }
                       compact
                     />
                   </TableCell>
                   <TableCell align="right">
                     <Button
                       size="small"
-                      variant={exceeded ? 'contained' : 'outlined'}
-                      color={exceeded ? 'warning' : 'primary'}
-                      disabled={run.id === undefined || draftGap === run.measuredGap}
+                      variant={status === 'exceeded' ? 'contained' : 'outlined'}
+                      color={status === 'exceeded' ? 'warning' : 'primary'}
+                      disabled={run.id === undefined || standardGap === null || draftGap === run.measuredGap}
                       onClick={() => {
-                        if (run.id !== undefined) void updateMeasuredGap(run.id, draftGap, mould?.stripeGap ?? draftGap)
+                        if (run.id !== undefined) void updateMeasuredGap(run.id, draftGap, standardGap, run.matchedVersionId)
                       }}
                     >
                       {draftGap === run.measuredGap ? '已记录' : '保存实测'}
@@ -273,7 +343,7 @@ export default function RunBoard() {
               )
             })}
             {filteredRuns.length === 0 && (
-              <TableRow><TableCell colSpan={6} align="center" sx={{ py: 5 }}>没有符合日期与帘号条件的工序</TableCell></TableRow>
+              <TableRow><TableCell colSpan={7} align="center" sx={{ py: 5 }}>没有符合日期与帘号条件的工序</TableCell></TableRow>
             )}
           </TableBody>
         </Table>
